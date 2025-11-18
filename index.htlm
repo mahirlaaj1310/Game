@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="hi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Guess My Number — Web Frontend</title>
+  <style>
+    :root{
+      --bg:#0f1720; --card:#0b1220; --accent:#0ea5a4; --muted:#94a3b8; --accent-2:#60a5fa;
+      color-scheme: dark;
+    }
+    html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+    body{background:linear-gradient(180deg,#071021 0%, #0b1220 100%); color:#e6eef6; display:flex; align-items:flex-start; padding:28px;}
+    .app { max-width:1100px; margin:0 auto; width:100%; display:grid; grid-template-columns: 360px 1fr; gap:20px; }
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:12px; padding:16px; box-shadow: 0 6px 18px rgba(2,6,23,0.6); }
+    h1{margin:4px 0 10px; font-size:20px}
+    .muted{color:var(--muted); font-size:13px}
+    button{background:var(--accent); color:#042027; border:0; padding:8px 12px; border-radius:8px; cursor:pointer;}
+    .ghost{background:transparent;border:1px solid rgba(255,255,255,0.06); color:var(--muted)}
+    input,select{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04); background:transparent;color:inherit;margin-top:6px}
+    .small{font-size:13px;padding:6px 8px;border-radius:6px}
+    .row{display:flex;gap:8px;align-items:center}
+    .center{display:flex;align-items:center;justify-content:center}
+    .notice{background:rgba(14,165,164,0.08); color:var(--accent); padding:8px;border-radius:8px;margin-top:8px}
+    .list{max-height:320px; overflow:auto; margin-top:8px; padding:8px; border-radius:8px; background:rgba(255,255,255,0.01)}
+    .chart{display:flex;flex-wrap:wrap;gap:6px}
+    .chip{padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.02);font-weight:600}
+    .flexcol{display:flex;flex-direction:column;gap:8px}
+    .controls{display:grid;grid-template-columns:1fr 1fr; gap:8px}
+    .rightpanel{display:flex;flex-direction:column;gap:12px}
+    .tx{font-size:13px;color:var(--muted)}
+    pre{white-space:pre-wrap; word-break:break-word; font-size:13px; margin:0}
+    footer{font-size:12px;color:var(--muted); margin-top:10px}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card">
+      <h1>Guess My Number (Web)</h1>
+      <div class="muted">Rounds: 60s • Numbers 1–10 • Payout ×8</div>
+
+      <div style="margin-top:12px" id="roundInfo"></div>
+
+      <div style="margin-top:12px" class="flexcol">
+        <div><strong>Current Round:</strong> <span id="currentRoundId">—</span></div>
+        <div class="row">
+          <div style="flex:1">
+            <strong>Countdown:</strong> <span id="countdown">--:--</span>
+            <div class="muted" id="roundStartTime"></div>
+          </div>
+          <div>
+            <button id="forceRevealBtn" title="Admin only" class="small ghost">Force Reveal (Admin)</button>
+          </div>
+        </div>
+      </div>
+
+      <hr style="border:none;height:1px;background:rgba(255,255,255,0.03);margin:12px 0">
+
+      <div>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <button id="showLogin">User Login</button>
+          <button id="showRegister" class="ghost">Register</button>
+          <button id="showAdmin" class="ghost">Admin</button>
+          <button id="showChart" class="ghost">View Chart</button>
+        </div>
+
+        <div id="panelArea"></div>
+      </div>
+
+      <footer>
+        <div class="tx">Data stored in browser localStorage (key: <code>gamedata_final</code>). Demo only — no network calls.</div>
+      </footer>
+    </div>
+
+    <div class="card rightpanel">
+      <div>
+        <strong>Recent Revealed Numbers</strong>
+        <div id="revealedChart" class="chart list" style="margin-top:8px;min-height:60px"></div>
+      </div>
+
+      <div>
+        <strong>Users</strong>
+        <div id="usersList" class="list tx">No users yet</div>
+      </div>
+
+      <div>
+        <strong>Logs</strong>
+        <div id="logArea" class="list" style="min-height:120px; font-size:13px"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  Implements the same game logic as your Java app:
+  - Rounds auto-start and auto-reveal every 60s.
+  - Bets are per-round, per-number, users have balance and history.
+  - Reveal logic: find min non-zero bet; compute possible payout = minBet * PAYOUT_MULTIPLIER;
+    if totalBet > possiblePayout -> minBetNumber wins
+    else if there are zero-bet numbers -> random choose among them
+    else -> minBetNumber wins
+  - If no bets at all -> random number winner
+  - Payout multiplier = 8
+  - Persistence via localStorage (gamedata_final)
+*/
+
+const MIN_NUM = 1, MAX_NUM = 10;
+const ROUND_INTERVAL_MS = 60_000; // 60s
+const PAYOUT_MULTIPLIER = 8;
+const STORAGE_KEY = 'gamedata_final';
+const ADMIN_PASS_DEFAULT = 'admin123';
+
+/* --- Data model persisted in localStorage --- */
+let data = {
+  users: {}, // username -> { username, password, balance, betsHistory: [] }
+  rounds: [], // list of round result objects
+  revealedNumbersChart: [],
+  adminPassword: ADMIN_PASS_DEFAULT,
+  nextRoundId: 1
+};
+
+let currentRound = null;
+let roundTimer = null;
+let roundEndsAt = 0;
+
+/* Utility */
+function nowFmt(ms=Date.now()) {
+  return new Date(ms).toLocaleString();
+}
+function log(msg) {
+  const a = document.getElementById('logArea');
+  const line = document.createElement('div');
+  line.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  a.prepend(line);
+}
+
+/* Load / Save */
+function saveData() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch(e) { console.error('Save failed', e); }
+}
+
+function loadData() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      // simple migration / validation:
+      data = Object.assign(data, parsed);
+      data.users = data.users || {};
+      data.rounds = data.rounds || [];
+      data.revealedNumbersChart = data.revealedNumbersChart || [];
+      data.nextRoundId = data.nextRoundId || 1;
+    } catch(e) {
+      console.warn('Failed to parse saved data, resetting.', e);
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  } else {
+    saveData();
+  }
+}
+
+/* Round management */
+function startNewRound() {
+  const rr = {
+    roundId: data.nextRoundId++,
+    startTime: Date.now(),
+    revealTime: 0,
+    revealedNumber: null,
+    totalPerNumber: {} // number->total
+  };
+  for (let i = MIN_NUM; i <= MAX_NUM; i++) rr.totalPerNumber[i] = 0;
+  currentRound = rr;
+  data.rounds.push(rr);
+  roundEndsAt = Date.now() + ROUND_INTERVAL_MS;
+  saveData();
+  updateUI();
+  log('New round started: ' + rr.roundId);
+}
+
+function addBet(username, number, amount) {
+  const u = data.users[username];
+  if (!u) return false;
+  // reduce user balance has been done by caller
+  const bet = { roundId: currentRound.roundId, number, amount, timestamp: nowFmt() };
+  u.betsHistory = u.betsHistory || [];
+  u.betsHistory.push(bet);
+  currentRound.totalPerNumber[number] = (currentRound.totalPerNumber[number] || 0) + amount;
+  saveData();
+  log(`${username} placed ₹${amount} on ${number} (R${currentRound.roundId})`);
+  updateUI();
+  return true;
+}
+
+/* Reveal logic (mirrors your Java algorithm) */
+function revealCurrentRound(reason='AUTO') {
+  if (!currentRound) return;
+  const rr = currentRound;
+  rr.revealTime = Date.now();
+
+  // STEP 1: Collect all bets per number across users for this round
+  const numberBets = {};
+  for (let i = MIN_NUM; i <= MAX_NUM; i++) numberBets[i] = 0;
+  Object.values(data.users).forEach(u=>{
+    (u.betsHistory||[]).forEach(b=>{
+      if (b.roundId === rr.roundId) {
+        numberBets[b.number] = (numberBets[b.number] || 0) + b.amount;
+      }
+    });
+  });
+
+  // STEP 2: Find minimum non-zero bet across numbers (based on total per number)
+  let minBet = Number.MAX_SAFE_INTEGER;
+  let minBetNumber = -1;
+  for (let i = MIN_NUM; i <= MAX_NUM; i++) {
+    const amt = numberBets[i] || 0;
+    if (amt > 0 && amt < minBet) {
+      minBet = amt;
+      minBetNumber = i;
+    }
+  }
+
+  // STEP 3: Find zero-bet numbers
+  const zeroBetNumbers = [];
+  for (let i = MIN_NUM; i <= MAX_NUM; i++) {
+    if ((numberBets[i]||0) === 0) zeroBetNumbers.push(i);
+  }
+
+  // STEP 4: Apply winner selection logic
+  let winner = -1;
+  if (minBetNumber !== -1) {
+    const possiblePayout = minBet * PAYOUT_MULTIPLIER;
+    let totalBet = 0;
+    for (const amt of Object.values(numberBets)) totalBet += amt;
+    if (totalBet > possiblePayout) {
+      winner = minBetNumber;
+    } else {
+      if (zeroBetNumbers.length > 0) {
+        const idx = cryptoRandomInt(0, zeroBetNumbers.length-1);
+        winner = zeroBetNumbers[idx];
+      } else {
+        winner = minBetNumber;
+      }
+    }
+  } else {
+    // no bets at all: random winner
+    winner = MIN_NUM + cryptoRandomInt(0, MAX_NUM - MIN_NUM);
+  }
+
+  rr.revealedNumber = winner;
+
+  // STEP 5: Update payouts & collect winners
+  const roundWinners = {};
+  Object.values(data.users).forEach(u=>{
+    let win = 0;
+    (u.betsHistory||[]).forEach(b=>{
+      if (b.roundId === rr.roundId && b.number === winner) {
+        win += b.amount * PAYOUT_MULTIPLIER;
+      }
+    });
+    if (win > 0) {
+      roundWinners[u.username] = win;
+      u.balance = (u.balance || 0) + win;
+    }
+  });
+
+  // STEP 6: Update chart
+  data.revealedNumbersChart = data.revealedNumbersChart || [];
+  data.revealedNumbersChart.push(winner);
+  if (data.revealedNumbersChart.length > 1000) data.revealedNumbersChart.shift();
+
+  saveData();
+
+  // Display reveal
+  let revealMsg = `ROUND REVEAL (${reason}) — Round ${rr.roundId} → Number ${winner}`;
+  log(revealMsg);
+  if (Object.keys(roundWinners).length === 0) {
+    log('No winners this round.');
+  } else {
+    for (const [user, amt] of Object.entries(roundWinners)) {
+      log(`User: ${user} | Won: ₹${amt}`);
+    }
+  }
+
+  // push to rounds array already done: start new round after reveal
+  startNewRound();
+}
+
+function autoRevealCheck() {
+  const remaining = roundEndsAt - Date.now();
+  if (remaining <= 0) {
+    // reveal now
+    revealCurrentRound('AUTO');
+  } else {
+    // update countdown UI
+    const s = Math.ceil(remaining/1000);
+    document.getElementById('countdown').innerText = pad(Math.floor(s/60)) + ':' + pad(s%60);
+  }
+}
+
+function pad(n){ return (n+'').padStart(2,'0'); }
+
+function cryptoRandomInt(min, max) {
+  // inclusive min..max
+  const range = max - min + 1;
+  const array = new Uint32Array(1);
+  window.crypto.getRandomValues(array);
+  return min + (array[0] % range);
+}
+
+/* --- UI & Flows --- */
+
+function updateRoundPanel() {
+  document.getElementById('currentRoundId').innerText = currentRound ? currentRound.roundId : '—';
+  document.getElementById('roundStartTime').innerText = currentRound ? `Started: ${new Date(currentRound.startTime).toLocaleTimeString()}` : '';
+  // revealed numbers area:
+  renderRevealedChart();
+  renderUsersList();
+}
+
+function renderUsersList() {
+  const node = document.getElementById('usersList');
+  const arr = Object.values(data.users);
+  if (arr.length === 0) { node.innerText = 'No users yet'; return; }
+  node.innerHTML = '';
+  arr.sort((a,b)=>b.balance - a.balance).forEach(u=>{
+    const div = document.createElement('div');
+    div.innerHTML = `<strong>${u.username}</strong> <span class="muted">| ₹${u.balance||0}</span><div class="tx" style="font-size:12px">Bets: ${ (u.betsHistory||[]).length }</div>`;
+    node.appendChild(div);
+  });
+}
+
+function renderRevealedChart() {
+  const el = document.getElementById('revealedChart');
+  el.innerHTML = '';
+  const arr = data.revealedNumbersChart || [];
+  if (arr.length === 0) { el.innerHTML = '<div class="muted">No reveals yet</div>'; return; }
+  // show last 40
+  const last = arr.slice(Math.max(0, arr.length - 40));
+  last.reverse().forEach((n, idx)=>{
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.innerText = `${n}`;
+    el.appendChild(chip);
+  });
+}
+
+/* Panels */
+function showPanel(contentHtml) {
+  const area = document.getElementById('panelArea');
+  area.innerHTML = contentHtml;
+}
+
+function showLoginPanel() {
+  showPanel(`
+    <div class="flexcol">
+      <label>Username<input id="login_user" /></label>
+      <label>Password<input id="login_pass" type="password" /></label>
+      <div class="row">
+        <button id="doLogin">Login</button>
+        <button id="toRegister" class="ghost">Go to Register</button>
+      </div>
+    </div>
+  `);
+  document.getElementById('toRegister').onclick = showRegisterPanel;
+  document.getElementById('doLogin').onclick = () => {
+    const u = document.getElementById('login_user').value.trim();
+    const p = document.getElementById('login_pass').value.trim();
+    const user = data.users[u];
+    if (!user || user.password !== p) { alert('Invalid credentials'); return; }
+    showUserDashboard(user.username);
+  };
+}
+
+function showRegisterPanel() {
+  showPanel(`
+    <div class="flexcol">
+      <label>Choose username<input id="reg_user" /></label>
+      <label>Choose password<input id="reg_pass" type="password" /></label>
+      <label>Initial credit (optional)<input id="reg_balance" placeholder="0" /></label>
+      <div class="row">
+        <button id="doReg">Register</button>
+        <button id="toLogin" class="ghost">Go to Login</button>
+      </div>
+    </div>
+  `);
+  document.getElementById('toLogin').onclick = showLoginPanel;
+  document.getElementById('doReg').onclick = () => {
+    const u = document.getElementById('reg_user').value.trim();
+    const p = document.getElementById('reg_pass').value.trim();
+    const bal = parseInt(document.getElementById('reg_balance').value || '0', 10) || 0;
+    if (!u || !p) { alert('Enter username and password'); return; }
+    if (data.users[u]) { alert('User exists'); return; }
+    data.users[u] = { username: u, password: p, balance: bal, betsHistory: [] };
+    saveData();
+    log(`User registered: ${u} (₹${bal})`);
+    alert('Registered. You can now login.');
+    showLoginPanel();
+    updateUI();
+  };
+}
+
+function showAdminPanel() {
+  showPanel(`
+    <div class="flexcol">
+      <label>Admin Password<input id="adm_pass" type="password" /></label>
+      <div class="row">
+        <button id="doAdminLogin">Login as Admin</button>
+        <button id="clearStorage" class="ghost">Reset All Data</button>
+      </div>
+    </div>
+  `);
+  document.getElementById('clearStorage').onclick = () => {
+    if (!confirm('Reset all data? This will erase users and rounds.')) return;
+    data = { users: {}, rounds: [], revealedNumbersChart: [], adminPassword: ADMIN_PASS_DEFAULT, nextRoundId: 1 };
+    saveData();
+    loadData();
+    startNewRound();
+    updateUI();
+    log('All data reset by user');
+    alert('Data reset.');
+  };
+  document.getElementById('doAdminLogin').onclick = () => {
+    const p = document.getElementById('adm_pass').value.trim();
+    if (p !== data.adminPassword) { alert('Wrong password'); return; }
+    showAdminDashboard();
+  };
+}
+
+function showAdminDashboard() {
+  let usersHtml = Object.values(data.users).map(u=>`<div style="padding:6px;border-bottom:1px dashed rgba(255,255,255,0.02)"><strong>${u.username}</strong> | ₹${u.balance} <div class="tx">Bets: ${(u.betsHistory||[]).length}</div>
+  <div style="margin-top:6px"><input placeholder="Credit amount" style="width:120px" id="credit_${u.username}"/><button data-user="${u.username}" class="creditBtn small ghost">Credit</button>
+  <button data-user="${u.username}" class="delBtn small ghost">Delete</button></div></div>`).join('') || '<div class="muted">No users</div>';
+
+  showPanel(`
+    <div class="flexcol">
+      <div class="row">
+        <button id="adminForceReveal">Force Reveal Now</button>
+        <button id="changeAdminPass" class="ghost">Change Admin Password</button>
+        <button id="viewRounds" class="ghost">View Rounds History</button>
+      </div>
+      <div style="margin-top:8px"><strong>Users</strong><div style="margin-top:6px" id="adminUsers">${usersHtml}</div></div>
+    </div>
+  `);
+
+  document.getElementById('adminForceReveal').onclick = () => {
+    if (!confirm('Force reveal current round now?')) return;
+    revealCurrentRound('ADMIN_FORCE');
+  };
+
+  document.getElementById('changeAdminPass').onclick = () => {
+    const np = prompt('New admin password:');
+    if (!np) return;
+    data.adminPassword = np;
+    saveData();
+    alert('Admin password updated.');
+    log('Admin password changed');
+  };
+
+  document.getElementById('viewRounds').onclick = () => {
+    const lines = data.rounds.map(r=>{
+      return `R${r.roundId} · Started: ${new Date(r.startTime).toLocaleString()} · Reveal: ${r.revealTime? new Date(r.revealTime).toLocaleString() : '...'} · Number: ${r.revealedNumber||'...'}`;
+    }).reverse().join('\n');
+    alert(lines || 'No rounds yet');
+  };
+
+  // attach credit/delete buttons
+  document.querySelectorAll('.creditBtn').forEach(btn=>{
+    btn.onclick = ()=>{
+      const user = btn.dataset.user;
+      const input = document.getElementById('credit_'+user);
+      const amt = parseInt(input.value || '0', 10) || 0;
+      if (amt<=0) { alert('Enter amount'); return; }
+      data.users[user].balance = (data.users[user].balance||0) + amt;
+      saveData();
+      log(`Admin credited ₹${amt} to ${user}`);
+      showAdminDashboard();
+      updateUI();
+    };
+  });
+  document.querySelectorAll('.delBtn').forEach(btn=>{
+    btn.onclick = ()=>{
+      const user = btn.dataset.user;
+      if (!confirm('Delete user '+user+'?')) return;
+      delete data.users[user];
+      saveData();
+      log('Admin deleted user '+user);
+      showAdminDashboard();
+      updateUI();
+    };
+  });
+}
+
+function showUserDashboard(username) {
+  const user = data.users[username];
+  if (!user) { alert('User missing'); return; }
+  showPanel(`
+    <div class="flexcol">
+      <div><strong>Hi, ${username}</strong> <span class="muted">| Balance: ₹${user.balance||0}</span></div>
+
+      <div style="display:grid;grid-template-columns: 1fr 1fr; gap:8px; margin-top:8px">
+        <div>
+          <label>Pick Number
+            <select id="bet_num">${[...Array(MAX_NUM-MIN_NUM+1)].map((_,i)=>`<option value="${MIN_NUM+i}">${MIN_NUM+i}</option>`).join('')}</select>
+          </label>
+        </div>
+        <div>
+          <label>Amount ₹<input id="bet_amt" type="number" min="1" placeholder="Amount"/></label>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:8px">
+        <button id="doBet">Place Bet</button>
+        <button id="viewHistory" class="ghost">View My History</button>
+        <button id="logout" class="ghost">Logout</button>
+      </div>
+    </div>
+  `);
+
+  document.getElementById('doBet').onclick = ()=>{
+    const n = parseInt(document.getElementById('bet_num').value, 10);
+    const a = parseInt(document.getElementById('bet_amt').value || '0', 10) || 0;
+    if (!n || n < MIN_NUM || n > MAX_NUM) return alert('Choose number 1-10');
+    if (a <= 0) return alert('Amount must be > 0');
+    if ((user.balance||0) < a) return alert('Insufficient balance');
+    user.balance -= a;
+    addBet(username, n, a);
+    saveData();
+    updateUI();
+    alert(`Bet placed ₹${a} on ${n} (Round ${currentRound.roundId})`);
+    showUserDashboard(username);
+  };
+
+  document.getElementById('viewHistory').onclick = ()=>{
+    const hist = (user.betsHistory||[]).map(b=>{
+      return `R${b.roundId} · Num ${b.number} · ₹${b.amount} · ${b.timestamp}`;
+    }).reverse().join('\n');
+    alert(hist || 'No bets yet');
+  };
+
+  document.getElementById('logout').onclick = () => {
+    showLoginPanel();
+  };
+}
+
+function showChartPanel() {
+  const rows = (data.revealedNumbersChart || []).map((num, idx) => `#${idx+1} → ${num}`).reverse().join('\n');
+  showPanel(`<div><pre>${rows || 'No numbers revealed yet.'}</pre></div>`);
+}
+
+/* Button wiring */
+document.getElementById('showLogin').onclick = showLoginPanel;
+document.getElementById('showRegister').onclick = showRegisterPanel;
+document.getElementById('showAdmin').onclick = showAdminPanel;
+document.getElementById('showChart').onclick = showChartPanel;
+document.getElementById('forceRevealBtn').onclick = ()=>{
+  const pass = prompt('Admin password to force reveal:');
+  if (!pass) return;
+  if (pass !== data.adminPassword) return alert('Wrong password');
+  revealCurrentRound('ADMIN_FORCE');
+};
+
+/* Initialisation */
+function updateUI() {
+  updateRoundPanel();
+  // list users and revealed chart already updated inside functions
+}
+function init() {
+  loadData();
+
+  // If no rounds exist, create one
+  if (!data.rounds || data.rounds.length === 0) startNewRound();
+  else {
+    // set currentRound to last round if it's not revealed yet
+    const last = data.rounds[data.rounds.length - 1];
+    if (last && !last.revealedNumber) currentRound = last;
+    else startNewRound();
+  }
+
+  // start interval timer
+  if (roundTimer) clearInterval(roundTimer);
+  roundTimer = setInterval(autoRevealCheck, 1000);
+
+  // show default panel
+  showLoginPanel();
+  updateUI();
+}
+
+// helper: periodically save data (in case)
+setInterval(saveData, 10000);
+
+init();
+
+/* Expose for debugging (optional) */
+window._GAME = { data, revealCurrentRound, startNewRound, addBet };
+</script>
+</body>
+</html>
